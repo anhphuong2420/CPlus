@@ -1,0 +1,799 @@
+================================================================================
+  CPlus — Intermediate Language (IL) Design Document
+================================================================================
+
+This document describes the complete design of the CPlus Intermediate Language:
+the data structures that represent it, every instruction in the instruction set,
+how the stack works, and how each AST node maps to IL instructions.
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+  1.  What Kind of IL
+  2.  IL Data Structures
+  3.  The Value Stack — how it works
+  4.  Instruction Set Reference
+        4.1  Constant Loads
+        4.2  Local Variable Load / Store
+        4.3  Parameter Load / Store
+        4.4  Field Load / Store
+        4.5  This Reference
+        4.6  Object Creation
+        4.7  Method Invocation
+        4.8  Arithmetic
+        4.9  Unary Operations
+        4.10 Comparison
+        4.11 Logical
+        4.12 String Operations
+        4.13 Type Conversion
+        4.14 Control Flow
+        4.15 Stack Manipulation
+        4.16 Return
+  5.  AST → IL Translation Rules
+        5.1  Program / Class / Field (structural, no instructions)
+        5.2  MethodDecl
+        5.3  Statements
+        5.4  Expressions
+        5.5  Resolving an ID
+  6.  Full Worked Example
+  7.  IL Generator Architecture (where to put the new pass)
+  8.  InvokeInstruction — the tricky part
+
+================================================================================
+1.  WHAT KIND OF IL
+================================================================================
+
+CPlus IL is a STACK-BASED intermediate language.
+
+Instead of named registers (like in LLVM IR or x86 assembly), every operation
+reads its inputs from a virtual stack and writes its result back to that same
+stack. This is the same model used by the JVM and .NET CIL.
+
+Why stack-based for CPlus:
+  - It is the simplest model to generate code for.
+  - Expressions in the AST are naturally recursive; recursion maps directly onto
+    a stack (evaluate left subtree → stack, evaluate right subtree → stack,
+    emit operator → pop two, push one).
+  - No register-allocation step is required.
+  - If you ever want to emit real .NET CIL or JVM bytecode, the model is
+    identical and the translation is straightforward.
+
+================================================================================
+2.  IL DATA STRUCTURES
+================================================================================
+
+The IL representation of a whole program is a tree of plain data objects
+(no logic, just fields). Here is the full hierarchy:
+
+  ILProgram
+  ├── List<ILClass> Classes
+
+  ILClass
+  ├── string Name
+  ├── List<ILField> Fields
+  └── List<ILMethod> Methods
+
+  ILField
+  ├── string Name
+  ├── DataType Type          (same DataType enum/hierarchy used in the AST)
+  ├── bool IsPublic
+  └── bool IsImmutable
+
+  ILMethod
+  ├── string Name
+  ├── DataType ReturnType
+  ├── List<ILLocal> Params   (ordered; index 0, 1, 2 ... matched by position)
+  ├── List<ILLocal> Locals   (ordered; index 0, 1, 2 ... separate from params)
+  └── List<ILInstruction> Instructions
+
+  ILLocal
+  ├── string Name            (kept for debugging / pretty-printing)
+  ├── DataType Type
+  └── int Index              (slot number; params and locals have independent
+                              index spaces starting at 0)
+
+  ILInstruction              (base — see Section 4 for every concrete subtype)
+  ├── Opcode Op
+  └── (subtype-specific fields — operand values)
+
+Notes:
+  - ILClass / ILField / ILMethod / ILLocal are STRUCTURAL — they are built
+    directly from AST nodes; they do not produce instructions.
+  - Only ILMethod.Instructions contains the actual executable IL.
+  - Params and Locals have SEPARATE index spaces. LOAD_ARG 0 is the first
+    parameter; LOAD_LOCAL 0 is the first local variable declared in the body.
+    These are two different slots.
+
+================================================================================
+3.  THE VALUE STACK — HOW IT WORKS
+================================================================================
+
+Every method has its own value stack. It starts empty when the method is called.
+
+Stack notation used throughout this document:
+
+  [..., a, b] -> [..., result]
+
+  The rightmost item is the TOP of the stack.
+  "..." means "whatever was already there (we don't care)".
+  "->" means "after the instruction executes".
+
+Rules:
+  - Instructions that READ values POP them from the stack.
+  - Instructions that PRODUCE values PUSH them onto the stack.
+  - At a RETURN or RETURN_VAL instruction the stack must be empty (for void)
+    or contain exactly one value (for non-void).
+  - Between statements the stack must always return to empty.
+    (A side-effect expression like a void method call that leaves nothing,
+    or a non-void call result that is discarded with POP.)
+
+Default values (used when NEW allocates an object and initialises fields):
+  int     → 0
+  float   → 0.0
+  boolean → false
+  string  → ""
+  class   → null
+
+================================================================================
+4.  INSTRUCTION SET REFERENCE
+================================================================================
+
+Format of each entry:
+
+  OPCODE_NAME   <operand type and meaning>
+    Effect on stack:  before -> after
+    Notes: ...
+
+--------------------------------------------------------------------------------
+4.1  CONSTANT LOADS
+--------------------------------------------------------------------------------
+
+  LOAD_CONST_INT   <int value>
+    Stack: [...] -> [..., int]
+    Pushes the given integer literal value onto the stack.
+
+  LOAD_CONST_FLOAT   <float value>
+    Stack: [...] -> [..., float]
+    Pushes the given float literal value onto the stack.
+
+  LOAD_CONST_BOOL   <bool value>   (true or false)
+    Stack: [...] -> [..., bool]
+    Pushes the given boolean literal value onto the stack.
+
+  LOAD_CONST_STR   <string value>
+    Stack: [...] -> [..., string]
+    Pushes the given string literal. Escape sequences (\n, \t, etc.)
+    are already resolved by the lexer before this point; the operand
+    holds the final string value, not the source text.
+
+  LOAD_NULL
+    Stack: [...] -> [..., null]
+    Pushes a null reference. Used as the default for uninitialized
+    class-type fields.
+    No operand.
+
+--------------------------------------------------------------------------------
+4.2  LOCAL VARIABLE LOAD / STORE
+--------------------------------------------------------------------------------
+
+Locals are the variables declared inside a method body (the `var_decl*` section
+before the statements). They are stored in slots indexed from 0.
+
+  LOAD_LOCAL   <int index>
+    Stack: [...] -> [..., value]
+    Reads the value currently in local slot `index` and pushes it.
+    Does not remove the value from the local slot.
+
+  STORE_LOCAL   <int index>
+    Stack: [..., value] -> [...]
+    Pops the top value and writes it into local slot `index`.
+
+--------------------------------------------------------------------------------
+4.3  PARAMETER LOAD / STORE
+--------------------------------------------------------------------------------
+
+Parameters are the arguments declared in the method signature. They are stored
+in their own index space, separate from locals, indexed from 0 in declaration
+order.
+
+  LOAD_ARG   <int index>
+    Stack: [...] -> [..., value]
+    Reads the value currently in parameter slot `index` and pushes it.
+
+  STORE_ARG   <int index>
+    Stack: [..., value] -> [...]
+    Pops the top value and writes it into parameter slot `index`.
+    (Rarely needed in CPlus since parameters are not reassignable
+    by language semantics, but the instruction exists for completeness.)
+
+--------------------------------------------------------------------------------
+4.4  FIELD LOAD / STORE
+--------------------------------------------------------------------------------
+
+Instance fields are always accessed through an object reference. The object
+reference must be on the stack before the instruction executes.
+
+  LOAD_FIELD   <string fieldName>
+    Stack: [..., obj] -> [..., value]
+    Pops the object reference `obj`, reads the field named `fieldName`
+    from it, and pushes the value.
+    Throws a null-reference error at runtime if obj is null.
+
+  STORE_FIELD   <string fieldName>
+    Stack: [..., obj, value] -> [...]
+    Pops `value` first (top of stack), then pops `obj`, and writes
+    `value` into the field named `fieldName` on `obj`.
+    IMPORTANT: the order on the stack is obj BELOW value. To store a
+    field you push the object reference FIRST, then the new value.
+    Throws a null-reference error at runtime if obj is null.
+
+--------------------------------------------------------------------------------
+4.5  THIS REFERENCE
+--------------------------------------------------------------------------------
+
+  LOAD_THIS
+    Stack: [...] -> [..., this]
+    Pushes the current object reference (the implicit first argument
+    of every instance method). No operand.
+    Used whenever you access a field or call a method on `this`.
+
+--------------------------------------------------------------------------------
+4.6  OBJECT CREATION
+--------------------------------------------------------------------------------
+
+  NEW   <string className>
+    Stack: [...] -> [..., obj]
+    Allocates a new heap object of the given class. All fields are
+    set to their default values (see Section 3). Pushes the reference.
+    Does NOT call any constructor; CPlus has no constructor syntax.
+
+--------------------------------------------------------------------------------
+4.7  METHOD INVOCATION
+--------------------------------------------------------------------------------
+
+Before either INVOKE instruction, the stack must look like:
+
+  [..., receiver, arg0, arg1, ..., argN-1]
+
+where:
+  - receiver  is the object the method is called on (pushed first)
+  - arg0..N-1 are the arguments in left-to-right order (pushed after)
+  - N         is the ArgCount stored in the instruction
+
+The runtime resolves the actual method using ClassName + MethodName.
+ClassName is the STATICALLY resolved type of the receiver (determined
+during semantic analysis), NOT the runtime type (CPlus has no
+inheritance / dynamic dispatch in the current design).
+
+  INVOKE   <ClassName> <MethodName> <ArgCount>
+    Stack: [..., receiver, arg0..argN-1] -> [..., returnValue]
+    Calls the non-void method. Pops ArgCount arguments, then the
+    receiver. Pushes the return value.
+    Use this when the call result is used as an expression value.
+
+  INVOKE_VOID   <ClassName> <MethodName> <ArgCount>
+    Stack: [..., receiver, arg0..argN-1] -> [...]
+    Calls a void method. Pops ArgCount arguments, then the receiver.
+    Nothing is pushed because there is no return value.
+    Use this for CallMethodStmt (the statement form of a method call).
+
+Why two separate opcodes instead of one?
+  The semantic checker already distinguishes CallExpression (non-void)
+  from CallMethodStmt (void). Carrying that distinction into the IL
+  makes the interpreter / backend simpler: it never needs to inspect
+  the return type at runtime to decide whether to push something.
+
+--------------------------------------------------------------------------------
+4.8  ARITHMETIC
+--------------------------------------------------------------------------------
+
+All binary arithmetic instructions pop two values (right first, then left)
+and push one result. Operands must be the same numeric type (int or float).
+If one side is int and the other float, emit INT_TO_FLOAT on the int side
+first (see Section 4.13).
+
+  ADD
+    Stack: [..., left, right] -> [..., left + right]
+    Integer or float addition. No operand.
+
+  SUB
+    Stack: [..., left, right] -> [..., left - right]
+    Integer or float subtraction. No operand.
+
+  MUL
+    Stack: [..., left, right] -> [..., left * right]
+    Integer or float multiplication. No operand.
+
+  DIV
+    Stack: [..., left, right] -> [..., left / right]
+    Integer or float division. Integer division truncates toward zero.
+    No operand.
+
+--------------------------------------------------------------------------------
+4.9  UNARY OPERATIONS
+--------------------------------------------------------------------------------
+
+  NEG
+    Stack: [..., value] -> [..., -value]
+    Arithmetic negation (unary minus). Operand must be int or float.
+    No operand.
+
+  NOT
+    Stack: [..., bool] -> [..., !bool]
+    Logical NOT. Operand must be bool. No operand.
+
+--------------------------------------------------------------------------------
+4.10  COMPARISON
+--------------------------------------------------------------------------------
+
+All comparison instructions pop two values and push a bool. Operands must
+be the same type.
+
+  EQ
+    Stack: [..., left, right] -> [..., left == right]
+    Works on int, float, bool, string, and object references. No operand.
+
+  NEQ
+    Stack: [..., left, right] -> [..., left != right]
+    No operand.
+
+  LT
+    Stack: [..., left, right] -> [..., left < right]
+    Numeric types only. No operand.
+
+  LTE
+    Stack: [..., left, right] -> [..., left <= right]
+    Numeric types only. No operand.
+
+  GT
+    Stack: [..., left, right] -> [..., left > right]
+    Numeric types only. No operand.
+
+  GTE
+    Stack: [..., left, right] -> [..., left >= right]
+    Numeric types only. No operand.
+
+Note: <, <=, >, >= are listed because SematicCheckerAuto already handles them
+even though they are currently commented out of the grammar. They are included
+here so the IL is not incomplete.
+
+--------------------------------------------------------------------------------
+4.11  LOGICAL
+--------------------------------------------------------------------------------
+
+At the IL level, && and || are NOT short-circuit; they are simple binary ops
+that pop two bools and push one bool. If you want short-circuit evaluation you
+implement it using JUMP_IF_FALSE / JUMP_IF_TRUE instead (see 4.14).
+
+  AND
+    Stack: [..., left, right] -> [..., left && right]
+    Both operands must be bool. No operand.
+
+  OR
+    Stack: [..., left, right] -> [..., left || right]
+    Both operands must be bool. No operand.
+
+--------------------------------------------------------------------------------
+4.12  STRING OPERATIONS
+--------------------------------------------------------------------------------
+
+  CONCAT
+    Stack: [..., left, right] -> [..., left + right]
+    String concatenation. Both operands must be string. No operand.
+    (The '+' operator on strings maps to CONCAT, not ADD.)
+
+--------------------------------------------------------------------------------
+4.13  TYPE CONVERSION
+--------------------------------------------------------------------------------
+
+  INT_TO_FLOAT
+    Stack: [..., int] -> [..., float]
+    Widens an int to a float. Used to satisfy the rule that int is
+    assignable to float. No operand.
+    Emit this before any arithmetic or comparison instruction where one
+    operand is int and the other is float.
+
+--------------------------------------------------------------------------------
+4.14  CONTROL FLOW
+--------------------------------------------------------------------------------
+
+Labels are string names that must be unique within a single method.
+The LABEL instruction itself does nothing at runtime — it is a marker.
+
+  LABEL   <string labelName>
+    Stack: unchanged.
+    Pseudo-instruction. Marks a position in the instruction list that
+    jump instructions can target. The interpreter skips it during
+    sequential execution.
+
+  JUMP   <string labelName>
+    Stack: unchanged.
+    Unconditionally transfers execution to the instruction after the
+    LABEL with the given name.
+
+  JUMP_IF_TRUE   <string labelName>
+    Stack: [..., bool] -> [...]
+    Pops a bool. If true, jumps to labelName. Otherwise falls through
+    to the next instruction.
+
+  JUMP_IF_FALSE   <string labelName>
+    Stack: [..., bool] -> [...]
+    Pops a bool. If false, jumps to labelName. Otherwise falls through.
+
+Pattern for `if (cond) { body }`:
+
+    <emit cond>
+    JUMP_IF_FALSE  end_if
+    <emit body>
+    LABEL          end_if
+
+Pattern for `if (cond) { then } else { else_body }`:
+
+    <emit cond>
+    JUMP_IF_FALSE  else_label
+    <emit then_body>
+    JUMP           end_if
+    LABEL          else_label
+    <emit else_body>
+    LABEL          end_if
+
+Pattern for `while (cond) { body }`:
+
+    LABEL          loop_start
+    <emit cond>
+    JUMP_IF_FALSE  loop_end
+    <emit body>
+    JUMP           loop_start
+    LABEL          loop_end
+
+CPlus does not currently have if/else or while in its grammar, but
+the instructions are included so the IL does not need to change
+when those features are added.
+
+Label naming convention (suggested):
+  Use a counter per method, e.g. "L0", "L1", "L2", ...
+  Or use descriptive names like "if_end_12", "while_start_5".
+
+--------------------------------------------------------------------------------
+4.15  STACK MANIPULATION
+--------------------------------------------------------------------------------
+
+  POP
+    Stack: [..., value] -> [...]
+    Discards the top value. Used when a non-void INVOKE result is not
+    needed (e.g. a method call used as a statement). No operand.
+
+  DUP
+    Stack: [..., value] -> [..., value, value]
+    Duplicates the top value without removing it. Useful when you need
+    to use a value and also keep it (e.g. store-and-keep patterns).
+    No operand.
+
+--------------------------------------------------------------------------------
+4.16  RETURN
+--------------------------------------------------------------------------------
+
+  RETURN
+    Stack must be empty.
+    Returns from a void method. No operand.
+
+  RETURN_VAL
+    Stack: [..., value] -> (exits method, value is the return value)
+    Pops the top value and returns it to the caller. Used for all
+    non-void methods. No operand.
+
+================================================================================
+5.  AST → IL TRANSLATION RULES
+================================================================================
+
+The IL generator is a new visitor pass that runs AFTER semantic analysis.
+It walks the AST and builds the ILProgram data structure.
+
+--------------------------------------------------------------------------------
+5.1  PROGRAM / CLASS / FIELD  (structural — no instructions emitted)
+--------------------------------------------------------------------------------
+
+  Program       -> create ILProgram, recurse into each ClassDecl
+  ClassDecl     -> create ILClass(name), recurse into fields and methods
+  FieldDecl     -> create ILField(name, type, isPublic, isImmutable)
+                   (no instructions — fields hold state, not code)
+
+--------------------------------------------------------------------------------
+5.2  METHODDECL
+--------------------------------------------------------------------------------
+
+When entering a MethodDecl:
+
+  1. Build param index table:
+       foreach (VarDecl p in method.Params)  →  paramIndex[p.Name.Name] = i++
+
+  2. Build local index table:
+       foreach (StoreDecl d in method.Decls) →  localIndex[d.Name.Name] = i++
+
+  3. For each local declaration that has an initializer (d.Value != null):
+       emit expression d.Value
+       emit STORE_LOCAL localIndex[d.Name.Name]
+
+  4. For each statement in method.Statements:
+       emit statement (see 5.3)
+
+  5. If the method is void and no explicit Return node is present,
+     emit RETURN at the end. (The semantic checker ensures non-void
+     methods always have a return on all paths, so this case is
+     only for void methods.)
+
+  Context object to carry through the walk:
+    - string currentClassName       (set when entering ClassDecl)
+    - Dictionary<string,int> paramIndex
+    - Dictionary<string,int> localIndex
+    - List<ILInstruction> instructions  (the list being built for this method)
+
+--------------------------------------------------------------------------------
+5.3  STATEMENTS
+--------------------------------------------------------------------------------
+
+  Return (void — Expression is null)
+    emit:  RETURN
+
+  Return (non-void — Expression is not null)
+    emit:  <expression>
+           RETURN_VAL
+
+  Assign (LHS is ID, i.e. a simple variable name)
+    emit:  <expression>
+    then:  if name is in paramIndex  → STORE_ARG  paramIndex[name]
+           if name is in localIndex  → STORE_LOCAL localIndex[name]
+           if name is a field of currentClass → LOAD_THIS
+                                                 <expression>   ← re-emit! see note
+                                                 STORE_FIELD name
+    NOTE: To store a field you need obj on the stack BEFORE the value.
+    So for field assignments the correct sequence is:
+           LOAD_THIS
+           <emit the right-hand-side expression>
+           STORE_FIELD fieldName
+
+  Assign (LHS is FieldAccess — obj.field = expr)
+    emit:  <obj expression>        ← pushes receiver
+           <value expression>      ← pushes new value
+           STORE_FIELD fieldName
+
+  CallMethodStmt (obj.method(args) as a statement — method must be void)
+    emit:  <obj expression>
+           <arg0 expression>
+           <arg1 expression>
+           ...
+           INVOKE_VOID currentClass.method argCount
+    Note: currentClass is the RESOLVED class of obj (from semantic analysis).
+    See Section 8 for how to obtain it.
+
+--------------------------------------------------------------------------------
+5.4  EXPRESSIONS
+--------------------------------------------------------------------------------
+
+  IntLiteral(v)         →  LOAD_CONST_INT  v
+  FloatLiteral(v)       →  LOAD_CONST_FLOAT v
+  BooleanLiteral(v)     →  LOAD_CONST_BOOL  v
+  StringLiteral(v)      →  LOAD_CONST_STR   v
+  ThisLiteral           →  LOAD_THIS
+
+  ID(name)              →  see Section 5.5
+
+  FieldAccess(obj, f)   →  <emit obj>
+                            LOAD_FIELD  f.Name
+
+  BinaryOp(op, L, R)
+    The op string comes from the grammar token text.
+    First check if either side needs INT_TO_FLOAT widening (one is int,
+    the other float); if so, emit INT_TO_FLOAT after the int operand.
+
+      op "+"  on numbers  →  <L>  <R>  ADD
+      op "+"  on strings  →  <L>  <R>  CONCAT
+      op "-"              →  <L>  <R>  SUB
+      op "*"              →  <L>  <R>  MUL
+      op "/"              →  <L>  <R>  DIV
+      op "=="             →  <L>  <R>  EQ
+      op "!="             →  <L>  <R>  NEQ
+      op "<"              →  <L>  <R>  LT
+      op "<="             →  <L>  <R>  LTE
+      op ">"              →  <L>  <R>  GT
+      op ">="             →  <L>  <R>  GTE
+      op "&&"             →  <L>  <R>  AND
+      op "||"             →  <L>  <R>  OR
+
+  UnaryOp("-", body)    →  <body>  NEG
+  UnaryOp("+", body)    →  <body>          (no-op; unary + is identity)
+  UnaryOp("!", body)    →  <body>  NOT
+
+  NewExpression(cls)    →  NEW  cls.Name
+
+  CallExpression(obj, method, args)   ← non-void call used as a value
+    emit:  <obj expression>
+           <arg0>
+           <arg1>
+           ...
+           INVOKE  resolvedClassName  method.Name  argCount
+
+--------------------------------------------------------------------------------
+5.5  RESOLVING AN ID
+--------------------------------------------------------------------------------
+
+When you encounter ID(name), look it up in this order:
+
+  1. Is name in paramIndex?        → LOAD_ARG  paramIndex[name]
+  2. Is name in localIndex?        → LOAD_LOCAL localIndex[name]
+  3. Is name a member of the current class (a field)?
+                                   → LOAD_THIS
+                                      LOAD_FIELD  name
+
+This mirrors exactly what the semantic checker does during its scope walk.
+If none of the three cases match, the semantic checker would have already
+caught it as an UndeclaredException, so you can assert/throw here.
+
+================================================================================
+6.  FULL WORKED EXAMPLE
+================================================================================
+
+Source code:
+
+  class Counter {
+      private int count;
+
+      public void reset() {
+          count = 0;
+      }
+
+      public void increment(int amount) {
+          count = count + amount;
+      }
+
+      public int get() {
+          return count;
+      }
+  }
+
+---- ILClass "Counter" ----
+
+  Fields:
+    ILField { Name="count", Type=IntType, IsPublic=false, IsImmutable=false }
+
+  ---- ILMethod "reset" ----
+    ReturnType: VoidType
+    Params:     (none)
+    Locals:     (none)
+
+    Instructions:
+      LOAD_THIS
+      LOAD_CONST_INT  0
+      STORE_FIELD  "count"
+      RETURN
+
+    Explanation:
+      To store `count = 0`:
+        Push this            (obj for STORE_FIELD)
+        Push 0               (value)
+        STORE_FIELD "count"  (pops value, pops obj, writes obj.count = 0)
+        RETURN               (void method)
+
+  ---- ILMethod "increment" ----
+    ReturnType: VoidType
+    Params:     [ ILLocal { Name="amount", Type=IntType, Index=0 } ]
+    Locals:     (none)
+
+    Instructions:
+      LOAD_THIS
+      LOAD_THIS
+      LOAD_FIELD   "count"
+      LOAD_ARG     0
+      ADD
+      STORE_FIELD  "count"
+      RETURN
+
+    Explanation:
+      count = count + amount  translates as:
+        LOAD_THIS           → push this (for the final STORE_FIELD)
+        LOAD_THIS           → push this (receiver for LOAD_FIELD)
+        LOAD_FIELD "count"  → pop this, push this.count
+        LOAD_ARG 0          → push parameter `amount`
+        ADD                 → pop amount, pop count, push count+amount
+        STORE_FIELD "count" → pop (count+amount), pop this, store
+        RETURN
+
+  ---- ILMethod "get" ----
+    ReturnType: IntType
+    Params:     (none)
+    Locals:     (none)
+
+    Instructions:
+      LOAD_THIS
+      LOAD_FIELD   "count"
+      RETURN_VAL
+
+    Explanation:
+      return count:
+        LOAD_THIS          → push this
+        LOAD_FIELD "count" → pop this, push this.count
+        RETURN_VAL         → pop and return the int value
+
+================================================================================
+7.  IL GENERATOR ARCHITECTURE
+================================================================================
+
+The IL generator is a new class that implements IASTVisitor<T>.
+
+Because different Visit methods need to return different things (e.g. visiting
+a MethodDecl builds an ILMethod, visiting an expression emits instructions into
+an existing list), the simplest approach is a SIDE-EFFECT visitor:
+
+  class ILGenerator : IASTVisitor<object?>
+  {
+      // Output
+      ILProgram program = new();
+
+      // Per-class state
+      ILClass currentILClass;
+      string currentClassName;
+
+      // Per-method state
+      ILMethod currentILMethod;
+      Dictionary<string, int> paramIndex  = new();
+      Dictionary<string, int> localIndex  = new();
+
+      // The working instruction list for the current method
+      List<ILInstruction> instructions => currentILMethod.Instructions;
+
+      // Counter for generating unique label names
+      int labelCounter = 0;
+      string NewLabel() => $"L{labelCounter++}";
+
+      // Resolved types (populated during semantic analysis — see Section 8)
+      Dictionary<Expression, DataType> resolvedTypes;
+
+      void Emit(ILInstruction instr) => instructions.Add(instr);
+      ...
+  }
+
+The compiler pipeline becomes:
+
+  Parse Tree
+    → CPlusASTVisitor     → AST
+    → GetEnv              → CompileEnviroment (symbol table)
+    → SematicCheckerAuto  → type-checks + ANNOTATES resolved types on expressions
+    → ILGenerator         → ILProgram
+    → (interpreter / backend)
+
+================================================================================
+8.  INVOKEINSTRUCTON — THE TRICKY PART
+================================================================================
+
+INVOKE and INVOKE_VOID both require the STATIC class name of the receiver, e.g.:
+  INVOKE "Counter" "increment" 1
+
+The AST node only gives you the receiver as an Expression. You need to know
+the type of that expression to find the class name. The type was computed by
+SematicCheckerAuto — but it is not stored anywhere right now.
+
+Solution: annotate the AST (or build a side table) during semantic analysis.
+
+Option A — add a property to Expression:
+  In CPlusAST.cs, add to Expression:
+    public DataType? ResolvedType { get; set; }
+  In SematicCheckerAuto, wherever a Visit method returns a DataType,
+  also set node.ResolvedType = that DataType before returning.
+
+Option B — side table (no AST changes):
+  Pass a Dictionary<Expression, DataType> through the compiler and fill it
+  during SematicCheckerAuto. Read from it during ILGenerator.
+
+Either approach works. Option A is simpler. Option B keeps the AST clean.
+
+Once you have the resolved type:
+  - If the receiver's ResolvedType is ClassType(className):
+      → INVOKE className methodName argCount
+  - If the receiver is ThisLiteral:
+      → the class is currentClassName
+  - The ClassName in the InvokeInstruction is the CLASS that OWNS the method,
+    not necessarily the class you are currently generating code in.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
