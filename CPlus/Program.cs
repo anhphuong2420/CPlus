@@ -1,102 +1,78 @@
-﻿using CPlus;
 using Antlr4.Runtime;
 using Antlr4.Runtime.Tree;
-using CPlusAST;
-using CPlus.SematicChecker;
-using CPlus.Exceptions.StaticErrors;
+using CPlus;
 using CPlus.Exceptions;
+using CPlus.IL;
+using CPlus.SematicChecker;
+using CPlusAST;
 
 public class Program
 {
-    static void Main(string[] args)
+    static int Main(string[] args)
     {
         if (args.Length == 0)
         {
-            Console.WriteLine("Usage: dotnet run <file_path>");
-            return;
+            Console.Error.WriteLine("Usage: cplus <file.cplus>");
+            return 1;
         }
 
-        string filePath = args[0];
-
+        var filePath = args[0];
         if (!File.Exists(filePath))
         {
-            Console.WriteLine($"Error: File '{filePath}' not found.");
-            return;
+            Console.Error.WriteLine($"Error: '{filePath}' not found.");
+            return 1;
         }
 
         try
         {
-            var generatedAST = GenerateAST(filePath);
-            var checker = new SematicChecker();
-            checker.Visit(generatedAST, new CompileEnviroment());
+            var ast       = Parse(filePath);
+            var env       = Analyse(ast);
+            var ilProgram = GenerateIL(ast, env);
+
+            Console.WriteLine(ilProgram.Dump());
+            Console.WriteLine("Compiled successfully.");
+            return 0;
         }
-        catch (ParseException e)
+        catch (CplusSyntaxException e)
         {
-            Console.WriteLine($"Syntax error: {e.Message}");
-            return;
+            Console.Error.WriteLine($"[Syntax]   {e.Message}");
+            return 1;
         }
-        catch (ErrorTokenException e)
+        catch (CplusStaticException e)
         {
-            Console.WriteLine($"Lexer error: {e.Message}");
-            return;
-        }
-        catch (RedeclaredException e)
-        {
-            Console.WriteLine($"Redeclaration error: {e.Message}");
-            return;
-        }
-        catch (UndeclaredException e)
-        {
-            Console.WriteLine($"Undeclared error: {e.Message}");
-            return;
-        }
-        catch (CannotAssignToConstantException e)
-        {
-            Console.WriteLine($"Constant assignment error: {e.Message}");
-            return;
-        }
-        catch (TypeMismatchInStatementException e)
-        {
-            Console.WriteLine($"Type mismatch in statement: {e.Message}");
-            return;
-        }
-        catch (TypeMismatchInExpressionException e)
-        {
-            Console.WriteLine($"Type mismatch in expression: {e.Message}");
-            return;
-        }
-        catch (IllegalConstantExpressionException e)
-        {
-            Console.WriteLine($"Illegal constant expression: {e.Message}");
-            return;
-        }
-        catch (IllegalMemberAccessException e)
-        {
-            Console.WriteLine($"Illegal member access: {e.Message}");
-            return;
+            Console.Error.WriteLine($"[Semantic] {e.Message}");
+            return 1;
         }
         catch (Exception e)
         {
-            Console.WriteLine($"Unexpected error: {e.Message}");
-            return;
+            Console.Error.WriteLine($"[Internal] {e}");
+            return 1;
         }
-        Console.WriteLine("Compiled successfully!");
-        Console.ReadKey();
     }
 
-    public static CPlusAST.Program GenerateAST(string filePath)
+    // -----------------------------------------------------------------------
+    // Pipeline stages
+    // -----------------------------------------------------------------------
+
+    private static CPlusAST.Program Parse(string filePath)
     {
         var inputStream = new AntlrFileStream(filePath);
+        var lexer       = new CPlusLexer(inputStream);
+        var tokens      = new CommonTokenStream(lexer);
+        var parser      = new CPlusParser(tokens) { ErrorHandler = new StrictErrorStrategy() };
+        var visitor     = new CPlusASTVisitor();
+        return (CPlusAST.Program)visitor.Visit(parser.program());
+    }
 
-        var lexer = new CPlusLexer(inputStream);
-        var tokens = new CommonTokenStream(lexer);
-        var parser = new CPlusParser(tokens);
-        // Throw error if rules aren't respect
-        parser.ErrorHandler = new StrictErrorStrategy();
+    private static CompileEnviroment Analyse(CPlusAST.Program ast)
+    {
+        var env = new CompileEnviroment();
+        new SematicCheckerAuto().Visit(ast, env);
+        return env;
+    }
 
-        IParseTree tree = parser.program();
-        var visitor = new CPlusASTVisitor();
-        var program = visitor.Visit(tree);
-        return (CPlusAST.Program)program;
+    private static ILProgram GenerateIL(CPlusAST.Program ast, CompileEnviroment env)
+    {
+        return new ILGenerator().Generate(ast, env);
     }
 }

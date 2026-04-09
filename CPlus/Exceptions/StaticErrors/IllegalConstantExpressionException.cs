@@ -3,7 +3,7 @@
     /// <summary>
     /// Thrown when a constant is assigned a non-static (non-literal) value.
     /// </summary>
-    public class IllegalConstantExpressionException : Exception
+    public class IllegalConstantExpressionException : CplusStaticException
     {
         public string ConstantName { get; }
         public string Expression { get; }

@@ -6,7 +6,7 @@
     /// Call statement: only void type could be call alone. Passing parameters obey the rules for assignment statement.
     /// Return statement: return expression can be consider as RHS and LHS is the return type of the method.
     /// </summary>
-    public class TypeMismatchInStatementException : Exception
+    public class TypeMismatchInStatementException : CplusStaticException
     {
         public string StatementType { get; } // e.g., "Assignment", "Call", "Return"
         public string ExpectedType { get; }

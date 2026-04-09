@@ -3,7 +3,7 @@
     /// <summary>
     /// Thrown when attempting to assign a value to a constant (immutable variable).
     /// </summary>
-    public class CannotAssignToConstantException : Exception
+    public class CannotAssignToConstantException : CplusStaticException
     {
         public string ConstantName { get; }
         public int Line { get; }

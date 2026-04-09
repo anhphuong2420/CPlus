@@ -3,7 +3,7 @@
     /// <summary>
     /// Thrown when attempting to access a private attribute or method.
     /// </summary>
-    public class IllegalMemberAccessException : Exception
+    public class IllegalMemberAccessException : CplusStaticException
     {
         public Kind Kind { get; } // Attribute or Method
         public string MemberName { get; }

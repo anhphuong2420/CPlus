@@ -100,7 +100,17 @@ namespace CPlusAST
 
 
     public abstract partial class Statement : AST { }
-    public abstract partial class Expression : Statement { }
+
+    public abstract partial class Expression : Statement
+    {
+        /// <summary>
+        /// Set by SematicCheckerAuto after type-checking. Used by ILGenerator
+        /// to resolve the class name for INVOKE / INVOKE_VOID and to decide
+        /// whether INT_TO_FLOAT widening is needed in binary expressions.
+        /// </summary>
+        public DataType? ResolvedType { get; set; }
+    }
+
     public abstract partial class LHS : Expression { } // Left hand side
 
 

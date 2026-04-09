@@ -3,7 +3,7 @@
     /// <summary>
     /// Thrown when a variable, constant, attribute, class, method, or parameter is redeclared.
     /// </summary>
-    public class RedeclaredException : Exception
+    public class RedeclaredException : CplusStaticException
     {
         public Kind Kind { get; }
         public string Name { get; }

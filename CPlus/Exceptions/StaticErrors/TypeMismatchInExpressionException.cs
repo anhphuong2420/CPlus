@@ -3,7 +3,7 @@
     /// <summary>
     /// Thrown when there’s a type mismatch in an expression.
     /// </summary>
-    public class TypeMismatchInExpressionException : Exception
+    public class TypeMismatchInExpressionException : CplusStaticException
     {
         public string Operator { get; } // e.g., "+", "=="
         public string ExpectedType { get; }

@@ -3,7 +3,7 @@
     /// <summary>
     /// Thrown when an identifier (variable, constant, attribute, class, method) is used but not declared.
     /// </summary>
-    public class UndeclaredException : Exception
+    public class UndeclaredException : CplusStaticException
     {
         public Kind Kind { get; }
         public string Name { get; }
