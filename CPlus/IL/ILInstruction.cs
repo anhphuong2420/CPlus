@@ -1,3 +1,5 @@
+using CPlusAST;
+
 namespace CPlus.IL
 {
     /// <summary>Base for all IL instructions. All subtypes are immutable records.</summary>
@@ -21,11 +23,17 @@ namespace CPlus.IL
 
     // -------------------------------------------------------------------------
     // Name-operand instructions
-    // Covers: LOAD_FIELD, STORE_FIELD  (field name)
-    //         NEW                       (class name)
+    // Covers: NEW                       (class name)
     //         LABEL, JUMP, JUMP_IF_TRUE, JUMP_IF_FALSE  (label name)
     // -------------------------------------------------------------------------
     public record NameInstruction(Opcode Op, string Name) : ILInstruction(Op);
+
+    // -------------------------------------------------------------------------
+    // Field instructions (LOAD_FIELD, STORE_FIELD)
+    // Carries owner class + field type so Dump can emit ldfld/stfld with full sig.
+    // -------------------------------------------------------------------------
+    public record FieldInstruction(Opcode Op, string OwnerClass, string FieldName, DataType FieldType)
+        : ILInstruction(Op);
 
     // -------------------------------------------------------------------------
     // Typed constant loads — one record per primitive type
@@ -44,7 +52,14 @@ namespace CPlus.IL
     //
     // ClassName is the statically resolved owner class (from semantic analysis).
     // ArgCount does NOT include the receiver.
+    // ReturnType and ParamTypes carry the full signature for ilasm call output.
     // -------------------------------------------------------------------------
-    public record InvokeInstruction(Opcode Op, string ClassName, string MethodName, int ArgCount)
+    public record InvokeInstruction(
+        Opcode Op,
+        string ClassName,
+        string MethodName,
+        int ArgCount,
+        DataType ReturnType,
+        IReadOnlyList<DataType> ParamTypes)
         : ILInstruction(Op);
 }

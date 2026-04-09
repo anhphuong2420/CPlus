@@ -45,6 +45,9 @@
     <None Update="LexerTests\test1.txt">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
+    <None Update="ILTests\counter.cplus">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
     <None Update="ASTTests\test1.txt">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>

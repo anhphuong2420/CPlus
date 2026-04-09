@@ -41,15 +41,37 @@ namespace CPlus.IL
         private string NewLabel() => $"L{_labelCounter++}";
 
         /// <summary>
-        /// Returns the class name that owns the method being called, by reading
-        /// the statically resolved type of the receiver expression.
+        /// Returns the class name that owns the method being called.
+        /// Reads the statically resolved type first; falls back to the current
+        /// class for <c>this</c> receivers (which always refer to the current class).
         /// </summary>
         private string ReceiverClassName(Expression expr)
         {
             if (expr.ResolvedType is ClassType ct)
                 return ct.ClassName.Name;
+            // 'this' always refers to the class currently being compiled.
+            if (expr is ThisLiteral)
+                return _currentClassName;
             throw new InvalidOperationException(
                 $"ILGenerator: cannot resolve class name — receiver has no ClassType ResolvedType ({expr})");
+        }
+
+        private MethodSymbol LookupMethod(CompileEnviroment env, string className, string methodName)
+        {
+            var cls = env.SymbolTable.LookupClass(className, 0, 0);
+            if (cls.Members.TryGetValue(methodName, out var sym) && sym is MethodSymbol ms)
+                return ms;
+            throw new InvalidOperationException(
+                $"ILGenerator: method '{methodName}' not found in class '{className}'");
+        }
+
+        private DataType LookupFieldType(CompileEnviroment env, string className, string fieldName)
+        {
+            var cls = env.SymbolTable.LookupClass(className, 0, 0);
+            if (cls.Members.TryGetValue(fieldName, out var sym))
+                return sym.Type;
+            throw new InvalidOperationException(
+                $"ILGenerator: field '{fieldName}' not found in class '{className}'");
         }
 
         // -----------------------------------------------------------------------
@@ -175,7 +197,9 @@ namespace CPlus.IL
                 // obj.field = expr  →  emit obj, emit value, STORE_FIELD
                 fa.Obj.Accept(this, env);
                 node.Expression.Accept(this, env);
-                Emit(new NameInstruction(Opcode.STORE_FIELD, fa.FieldName.Name));
+                var ownerClass = ReceiverClassName(fa.Obj);
+                var fieldType  = LookupFieldType(env, ownerClass, fa.FieldName.Name);
+                Emit(new FieldInstruction(Opcode.STORE_FIELD, ownerClass, fa.FieldName.Name, fieldType));
             }
             else if (node.LHS is ID id)
             {
@@ -195,7 +219,8 @@ namespace CPlus.IL
                     // Stack rule: obj must be below value for STORE_FIELD
                     Emit(new SimpleInstruction(Opcode.LOAD_THIS));
                     node.Expression.Accept(this, env);
-                    Emit(new NameInstruction(Opcode.STORE_FIELD, id.Name));
+                    var fieldType = LookupFieldType(env, _currentClassName, id.Name);
+                    Emit(new FieldInstruction(Opcode.STORE_FIELD, _currentClassName, id.Name, fieldType));
                 }
             }
             return null;
@@ -209,8 +234,11 @@ namespace CPlus.IL
             foreach (var arg in node.Params)
                 arg.Accept(this, env);
 
-            var className = ReceiverClassName(node.Obj);
-            Emit(new InvokeInstruction(Opcode.INVOKE_VOID, className, node.Method.Name, node.Params.Count()));
+            var className  = ReceiverClassName(node.Obj);
+            var methodSym  = LookupMethod(env, className, node.Method.Name);
+            var paramTypes = methodSym.Parameters.Select(p => p.DataType).ToList();
+            Emit(new InvokeInstruction(Opcode.INVOKE_VOID, className, node.Method.Name,
+                node.Params.Count(), methodSym.Type, paramTypes));
             return null;
         }
 
@@ -272,8 +300,11 @@ namespace CPlus.IL
             foreach (var arg in node.Params)
                 arg.Accept(this, env);
 
-            var className = ReceiverClassName(node.Obj);
-            Emit(new InvokeInstruction(Opcode.INVOKE, className, node.Method.Name, node.Params.Count()));
+            var className  = ReceiverClassName(node.Obj);
+            var methodSym  = LookupMethod(env, className, node.Method.Name);
+            var paramTypes = methodSym.Parameters.Select(p => p.DataType).ToList();
+            Emit(new InvokeInstruction(Opcode.INVOKE, className, node.Method.Name,
+                node.Params.Count(), methodSym.Type, paramTypes));
             return null;
         }
 
@@ -286,7 +317,9 @@ namespace CPlus.IL
         public object? Visit(FieldAccess node, CompileEnviroment env)
         {
             node.Obj.Accept(this, env);
-            Emit(new NameInstruction(Opcode.LOAD_FIELD, node.FieldName.Name));
+            var ownerClass = ReceiverClassName(node.Obj);
+            var fieldType  = LookupFieldType(env, ownerClass, node.FieldName.Name);
+            Emit(new FieldInstruction(Opcode.LOAD_FIELD, ownerClass, node.FieldName.Name, fieldType));
             return null;
         }
 
@@ -304,7 +337,8 @@ namespace CPlus.IL
             {
                 // Field of `this`
                 Emit(new SimpleInstruction(Opcode.LOAD_THIS));
-                Emit(new NameInstruction(Opcode.LOAD_FIELD, node.Name));
+                var fieldType = LookupFieldType(env, _currentClassName, node.Name);
+                Emit(new FieldInstruction(Opcode.LOAD_FIELD, _currentClassName, node.Name, fieldType));
             }
             return null;
         }

@@ -1,0 +1,15 @@
+class Counter {
+    private int count;
+
+    public void increment(int amount) {
+        count = count + amount;
+    }
+
+    public int get() {
+        return count;
+    }
+
+    public void main() {
+        this.increment(1);
+    }
+}
